@@ -23,6 +23,14 @@ function summarizeFarmStatus(status) {
 
 function getWorkCount(status, key) {
   if (!status || !status.workCounts || typeof status.workCounts !== "object") return 0;
+  if (key === "farming") {
+    return (
+      (Number(status.workCounts.water) || 0) +
+      (Number(status.workCounts.eraseGrass) || 0) +
+      (Number(status.workCounts.killBug) || 0) +
+      (Number(status.workCounts.eraseDead) || 0)
+    );
+  }
   return Number(status.workCounts[key]) || 0;
 }
 
@@ -782,9 +790,9 @@ async function runCurrentFarmOneClickTasks(session, callGameCtl, opts) {
 
   if (includeCollect) specs.push({ key: "collect", op: "HARVEST" });
   if (farmType === "own") {
-    if (includeEraseGrass) specs.push({ key: "eraseGrass", op: "ERASE_GRASS" });
-    if (includeKillBug) specs.push({ key: "killBug", op: "KILL_BUG" });
-    if (includeWater) specs.push({ key: "water", op: "WATER" });
+    // 新版游戏将浇水/除草/除虫合并为"一键务农"（FARMING）
+    const needsFarming = includeEraseGrass || includeKillBug || includeWater;
+    if (needsFarming) specs.push({ key: "farming", op: "FARMING" });
   }
 
   const actions = [];
@@ -823,7 +831,7 @@ async function runCurrentFarmOneClickTasks(session, callGameCtl, opts) {
     }
 
     try {
-      if (useBatchCareExpCheck && spec.key !== "collect") {
+      if (useBatchCareExpCheck && spec.key !== "collect" && spec.key !== "farming") {
         const careSpec = {
           key: spec.key,
           ...getCareActionExecutor(spec.key),

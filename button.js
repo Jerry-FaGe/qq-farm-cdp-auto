@@ -9,9 +9,12 @@
   let cachedGlobalDataRuntime = null;
   let cachedOops = null;
   let cachedItemManager = null;
+  let cachedItemManagerIns = null;  // ItemManager.ins 单例
   let cachedMessageBus = null;
   let cachedProtobufRuntime = null;
   let cachedNetWebSocketRuntime = null;
+  let cachedSingeltonModuleComp = null;
+  let __moduleImportDone = false;
   const reconnectWatcherState = {
     timer: null,
     running: false,
@@ -22,6 +25,58 @@
     lastHandledAt: 0,
     lastResult: null
   };
+
+  // 通过 System.import 预加载关键模块 (itemM 异步初始化，先缓存 oops 引用)
+  (function _eagerImportModules() {
+    var sys = G.System;
+    if (!sys || typeof sys.import !== 'function') {
+      __moduleImportDone = true;
+      return;
+    }
+    var modules = [
+      { id: 'chunks:///_virtual/Oops.ts', onLoad: function (mod) {
+        if (mod && mod.oops && typeof mod.oops === 'object') {
+          var o = mod.oops;
+          cachedOops = o;
+          if (o.message) cachedMessageBus = o.message;
+          if (o.protobufDefault) cachedProtobufRuntime = o.protobufDefault;
+          if (o.netWebSocket) cachedNetWebSocketRuntime = o.netWebSocket;
+          if (o.itemM) cachedItemManager = o.itemM;
+        }
+      }},
+      { id: 'chunks:///_virtual/MessageManager.ts', onLoad: function (mod) {
+        if (mod && mod.message && typeof mod.message === 'object') {
+          cachedMessageBus = mod.message;
+        }
+      }},
+      { id: 'chunks:///_virtual/SingletonModuleComp.ts', onLoad: function (mod) {
+        if (mod && mod.smc && typeof mod.smc === 'object') cachedSingeltonModuleComp = mod.smc;
+      }},
+      { id: 'chunks:///_virtual/GlobalData.ts', onLoad: function (mod) {
+        if (mod && mod.GlobalData && typeof mod.GlobalData === 'object' &&
+            mod.GlobalData.selfModel && typeof mod.GlobalData.selfModel === 'object') {
+          cachedGlobalDataRuntime = { source: 'System.import:GlobalData.ts', globalData: mod.GlobalData };
+          rememberSelfGid(mod.GlobalData.selfModel && mod.GlobalData.selfModel.gid);
+        }
+      }},
+      { id: 'chunks:///_virtual/ItemManager.ts', onLoad: function (mod) {
+        if (mod && mod.ItemManager && mod.ItemManager.ins) {
+          cachedItemManagerIns = mod.ItemManager.ins;
+          if (!cachedItemManager && mod.ItemManager.ins) cachedItemManager = mod.ItemManager.ins;
+        }
+      }}
+    ];
+    var pending = modules.length;
+    modules.forEach(function (item) {
+      sys.import(item.id).then(function (mod) {
+        try { item.onLoad(mod); } catch (_) {}
+      }).catch(function () {}).finally(function () {
+        pending--;
+        if (pending <= 0) __moduleImportDone = true;
+      });
+    });
+    setTimeout(function () { __moduleImportDone = true; }, 3000);
+  })();
 
   function out(v) {
     try { console.dir(v); } catch (_) {}
@@ -1145,6 +1200,24 @@
       }
     }
 
+    // AMD require 查找
+    var amdRequire = G.require || (G.GameGlobal && G.GameGlobal.require);
+    if (typeof amdRequire === 'function') {
+      for (var ai = 0; ai < ids.length; ai++) {
+        try {
+          var raw2 = amdRequire(ids[ai]);
+          var ns2 = unwrapModuleNamespace(raw2);
+          if (ns2) {
+            return {
+              moduleId: ids[ai],
+              source: 'amd_require',
+              namespace: ns2
+            };
+          }
+        } catch (_) {}
+      }
+    }
+
     return null;
   }
 
@@ -1221,6 +1294,60 @@
           }
         }
       }
+    }
+
+    // AMD require 查找 (新版游戏使用 define/require)
+    var amdRequire = G.require || (G.GameGlobal && G.GameGlobal.require);
+    if (typeof amdRequire === 'function') {
+      for (var ai = 0; ai < ids.length; ai++) {
+        try {
+          var raw2 = amdRequire(ids[ai]);
+          if (raw2) {
+            var match2 = scan(raw2);
+            if (match2) {
+              return {
+                moduleId: ids[ai],
+                source: 'amd_require',
+                namespace: match2.namespace,
+                exportName: match2.exportName,
+                value: match2.value
+              };
+            }
+          }
+        } catch (_) {}
+      }
+      // 尝试 AMD 注册表向后查找
+      try {
+        var amdRegs = [
+          amdRequire.s && amdRequire.s.contexts && amdRequire.s.contexts._ && amdRequire.s.contexts._.defined,
+          amdRequire.modules,
+          amdRequire._modules
+        ].filter(Boolean);
+        for (var ri = 0; ri < amdRegs.length; ri++) {
+          var regKeys = Object.keys(amdRegs[ri]).slice(0, 200);
+          for (var rk = 0; rk < regKeys.length; rk++) {
+            var key = regKeys[rk];
+            for (var ai2 = 0; ai2 < ids.length; ai2++) {
+              if (key.indexOf(ids[ai2]) >= 0 || ids[ai2].indexOf(key) >= 0) {
+                var rv = amdRegs[ri][key];
+                if (rv) {
+                  var scanTarget = rv.exports || rv.module || rv;
+                  var match3 = scan(scanTarget);
+                  if (match3) {
+                    return {
+                      moduleId: key,
+                      source: 'amd_registry',
+                      namespace: match3.namespace,
+                      exportName: match3.exportName,
+                      value: match3.value
+                    };
+                  }
+                }
+              }
+            }
+          }
+        }
+      } catch (_) {}
     }
 
     return null;
@@ -3532,11 +3659,11 @@
   }
 
   function getOneClickOperationNames() {
-    return ['HARVEST', 'WATER', 'ERASE_GRASS', 'KILL_BUG'];
+    return ['HARVEST', 'FARMING'];
   }
 
   function resolveOneClickOperationIndex(typeOrIndex) {
-    if (typeof typeOrIndex === 'number' && isFinite(typeOrIndex)) return typeOrIndex;
+    if (typeof typeOrIndex === 'number' && isFinite(typeOrIndex) && typeOrIndex < 2) return typeOrIndex;
     const raw = String(typeOrIndex == null ? 'HARVEST' : typeOrIndex).trim().toUpperCase();
     const aliases = {
       'HARVEST': 0,
@@ -3547,12 +3674,15 @@
       '一键收获': 0,
       'WATER': 1,
       '浇水': 1,
-      'ERASE_GRASS': 2,
-      'GRASS': 2,
-      '除草': 2,
-      'KILL_BUG': 3,
-      'BUG': 3,
-      '除虫': 3
+      'ERASE_GRASS': 1,
+      'GRASS': 1,
+      '除草': 1,
+      'KILL_BUG': 1,
+      'BUG': 1,
+      '除虫': 1,
+      'FARMING': 1,
+      '务农': 1,
+      '一键务农': 1
     };
     if (aliases.hasOwnProperty(raw)) return aliases[raw];
     throw new Error('Unknown one-click operation: ' + typeOrIndex);
@@ -3639,19 +3769,22 @@
   }
 
   function resolveOops() {
+    if (cachedOops && typeof cachedOops === 'object') return cachedOops;
     if (rememberOops(cachedOops)) return cachedOops;
 
-    const resolved = getSystemExportRuntime(
-      ['chunks:///_virtual/Oops.ts', './Oops.ts'],
-      'oops'
-    );
-    if (resolved && rememberOops(resolved.value)) return cachedOops;
+    if (__moduleImportDone) {
+      var resolved = getSystemExportRuntime(
+        ['chunks:///_virtual/Oops.ts', './Oops.ts'],
+        'oops'
+      );
+      if (resolved && rememberOops(resolved.value)) return cachedOops;
+    }
 
-    const directCandidates = [
+    var directCandidates = [
       G.oops,
       G.GameGlobal && G.GameGlobal.oops
     ];
-    for (let i = 0; i < directCandidates.length; i++) {
+    for (var i = 0; i < directCandidates.length; i++) {
       if (rememberOops(directCandidates[i])) return cachedOops;
     }
 
@@ -3659,12 +3792,27 @@
   }
 
   function getItemManager() {
+    // 1. 尝试 ItemManager.ins 单例
+    if (cachedItemManagerIns && isItemManagerLike(cachedItemManagerIns)) {
+      cachedItemManager = cachedItemManagerIns;
+      return cachedItemManager;
+    }
+    // 2. 尝试通过 System.import 延迟加载
+    try {
+      var sys2 = G.System;
+      if (sys2 && typeof sys2.import === 'function' && !cachedItemManagerIns) {
+        // 同步方式不可行，检查是否已缓存
+      }
+    } catch (_) {}
+    // 3. 尝试 oops.itemM
     const oops = resolveOops();
     if (oops && isItemManagerLike(oops.itemM)) {
       cachedItemManager = oops.itemM;
       return cachedItemManager;
     }
+    // 4. 尝试缓存
     if (isItemManagerLike(cachedItemManager)) return cachedItemManager;
+    // 5. 尝试全局
     if (isItemManagerLike(G.itemM)) {
       cachedItemManager = G.itemM;
       return cachedItemManager;
@@ -3677,6 +3825,7 @@
   }
 
   function getOopsMessage() {
+    if (isMessageBusLike(cachedMessageBus)) return cachedMessageBus;
     const oops = resolveOops();
     if (oops && isMessageBusLike(oops.message)) {
       cachedMessageBus = oops.message;
@@ -3713,6 +3862,7 @@
   }
 
   function getNetWebSocket() {
+    if (isNetWebSocketLike(cachedNetWebSocketRuntime)) return cachedNetWebSocketRuntime;
     const oops = resolveOops();
     if (oops && isNetWebSocketLike(oops.netWebSocket)) {
       cachedNetWebSocketRuntime = oops.netWebSocket;
@@ -4226,12 +4376,15 @@
   }
 
   function getSingletonModuleComp() {
+    if (cachedSingeltonModuleComp && typeof cachedSingeltonModuleComp === 'object') return cachedSingeltonModuleComp;
+
     const resolved = getSystemExportRuntime(
       ['chunks:///_virtual/SingletonModuleComp.ts', './SingletonModuleComp.ts'],
       'smc'
     );
     if (resolved && resolved.value && typeof resolved.value === 'object') {
-      return resolved.value;
+      cachedSingeltonModuleComp = resolved.value;
+      return cachedSingeltonModuleComp;
     }
 
     const directCandidates = [
@@ -4240,7 +4393,10 @@
     ];
     for (let i = 0; i < directCandidates.length; i++) {
       const smc = directCandidates[i];
-      if (smc && typeof smc === 'object') return smc;
+      if (smc && typeof smc === 'object') {
+        cachedSingeltonModuleComp = smc;
+        return smc;
+      }
     }
 
     throw new Error('smc not found');
@@ -6709,7 +6865,10 @@
     diffSnapshots,
     tapAndSnapshot,
     batchTap,
-    tapFarmCandidates
+    tapFarmCandidates,
+    _resolveOops: resolveOops,
+    _getSingletonModuleComp: getSingletonModuleComp,
+    _getSystemModule: getSystemModule
   };
 
   startReconnectWatcher({ silent: true });
@@ -6718,6 +6877,63 @@
     ready: true,
     scene: scene() ? scene().name : null,
     farmRoot: (findFarmRoot() && fullPath(findFarmRoot())) || null,
+    _diag: (function () {
+      var d = {};
+      d.hasSystem = typeof G.System !== 'undefined';
+      d.hasSystemJS = typeof G.SystemJS !== 'undefined';
+      d.has_system = typeof G.__system__ !== 'undefined';
+      d.hasRequire = typeof G.require === 'function';
+      d.hasDefine = typeof G.define === 'function';
+      d.hasSmcGlobal = !!(G.smc || (G.GameGlobal && G.GameGlobal.smc));
+      d.hasOopsGlobal = !!(G.oops || (G.GameGlobal && G.GameGlobal.oops));
+      d.hasGlobalData = !!(G.GlobalData || (G.GameGlobal && G.GameGlobal.GlobalData));
+      d.eagerImportDone = __moduleImportDone;
+      d.hasCachedOops = !!cachedOops;
+      d.hasCachedSmc = !!cachedSingeltonModuleComp;
+      d.hasCachedGlobalData = !!cachedGlobalDataRuntime;
+      // 尝试列举 System/__system__ 中有多少模块
+      try {
+        var sysArr = [G.System, G.SystemJS, G.__system__].filter(Boolean);
+        d.systemModules = sysArr.map(function (s) {
+          var r = {};
+          if (s._loader && s._loader.modules) {
+            if (typeof s._loader.modules.size === 'number') r.loader_modules_size = s._loader.modules.size;
+            else if (typeof s._loader.modules === 'object') r.loader_modules_keys = Object.keys(s._loader.modules).length;
+          }
+          if (s._loader && s._loader.moduleRecords) {
+            if (typeof s._loader.moduleRecords.size === 'number') r.loader_records_size = s._loader.moduleRecords.size;
+          }
+          if (s.registry) {
+            if (typeof s.registry.size === 'number') r.registry_size = s.registry.size;
+          }
+          return r;
+        });
+      } catch (_) { d.systemModules = null; }
+      // AMD require 模块注册表大小
+      try {
+        var amdr = G.require || (G.GameGlobal && G.GameGlobal.require);
+        if (amdr) {
+          d.amdRegistrySizes = {};
+          [
+            ['s_contexts_defined', amdr.s && amdr.s.contexts && amdr.s.contexts._ && amdr.s.contexts._.defined],
+            ['modules', amdr.modules],
+            ['_modules', amdr._modules]
+          ].forEach(function (p) {
+            if (p[1] && typeof p[1] === 'object') {
+              d.amdRegistrySizes[p[0]] = Object.keys(p[1]).length;
+            }
+          });
+        }
+      } catch (_) { d.amdRegistrySizes = null; }
+      // 尝试搜索 oops
+      try {
+        var oopsRes = resolveOops();
+        d.oopsResolved = !!oopsRes;
+      } catch (_) { d.oopsResolved = false; }
+      // 显式输出诊断到控制台
+      try { console.log('[button.js DIAG]', JSON.parse(JSON.stringify(d))); } catch (_) {}
+      return d;
+    })(),
     api: [
       'gameCtl.dumpButtons(keyword, opts)',
       'gameCtl.smartClick(path, index)',
